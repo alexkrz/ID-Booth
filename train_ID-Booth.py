@@ -16,9 +16,11 @@
 import argparse
 import copy
 import gc
+import json
 import logging
 import math
 import os
+import re
 import shutil
 import warnings
 from pathlib import Path
@@ -31,6 +33,7 @@ import transformers
 from accelerate import Accelerator
 from accelerate.logging import get_logger
 from accelerate.utils import ProjectConfiguration, set_seed
+from facenet_pytorch import MTCNN  # I really do not want to use facenet-pytorch!
 from huggingface_hub import create_repo, upload_folder
 from huggingface_hub.utils import insecure_hashlib
 from packaging import version
@@ -43,7 +46,9 @@ from torchvision import transforms
 from tqdm.auto import tqdm
 from transformers import AutoTokenizer, PretrainedConfig
 
+import configs.config_train_SD21 as cfg
 import diffusers
+from ArcFace_files.ArcFace_functions import prepare_locked_ArcFace_model, preprocess_image_for_ArcFace
 from diffusers import (
     AutoencoderKL,
     DDPMScheduler,
@@ -63,21 +68,14 @@ from diffusers.utils import (
 from diffusers.utils.hub_utils import load_or_create_model_card, populate_model_card
 from diffusers.utils.import_utils import is_xformers_available
 from diffusers.utils.torch_utils import is_compiled_module
-
-from ArcFace_files.ArcFace_functions import preprocess_image_for_ArcFace, prepare_locked_ArcFace_model
-#from ArcFace_dataset import ArcFaceDataset, collate_fn_arcface
-import re 
-from facenet_pytorch import MTCNN
-
-import configs.config_train_SD21 as cfg
 from utils.sorting_utils import natural_keys
-import json 
 
 
 # Will error if the minimal version of diffusers is not installed. Remove at your own risks.
 # check_min_version("0.27.0.dev0")
 
 logger = get_logger(__name__)
+
 
 def dict_from_module(module):
     context = {}
@@ -87,6 +85,7 @@ def dict_from_module(module):
             context[setting] = getattr(module, setting)
 
     return context
+
 
 def save_model_card(
     repo_id: str,
@@ -138,8 +137,7 @@ def log_validation(
     is_final_validation=False,
 ):
     logger.info(
-        f"Running validation... \n Generating {cfg.num_validation_images} images with prompt:"
-        f" {cfg.validation_prompt}."
+        f"Running validation... \n Generating {cfg.num_validation_images} images with prompt: {cfg.validation_prompt}."
     )
     # We train on the simplified learning objective. If we were previously predicting a variance, we need the scheduler to ignore it
     scheduler_args = {}
@@ -168,7 +166,7 @@ def log_validation(
             image = pipeline(**pipeline_args, generator=generator).images[0]
             images.append(image)
             folder_path = os.path.join(args.output_dir, phase_name)
-            os.makedirs(folder_path,exist_ok=True)
+            os.makedirs(folder_path, exist_ok=True)
             image_filename = f"{folder_path}/{epoch}_validation_img_{i}.jpg"
             image.save(image_filename)
 
@@ -179,7 +177,7 @@ def log_validation(
     #         with torch.cuda.amp.autocast():
     #             image = pipeline(**pipeline_args, image=image, generator=generator).images[0]
     #         images.append(image)
-            
+
     for tracker in accelerator.trackers:
         if tracker.name == "tensorboard":
             np_images = np.stack([np.asarray(img) for img in images])
@@ -226,7 +224,7 @@ def parse_args(input_args=None):
     env_local_rank = int(os.environ.get("LOCAL_RANK", -1))
     if env_local_rank != -1 and env_local_rank != cfg.local_rank:
         cfg.local_rank = env_local_rank
-    
+
     return args
 
 
@@ -261,34 +259,36 @@ class DreamBoothDataset(Dataset):
         if not self.instance_data_root.exists():
             raise ValueError("Instance images root doesn't exists.")
 
-        self.instance_images_path = sorted(list(Path(instance_data_root).iterdir()))
-        #self.instance_images_path.sort(key=natural_keys)
-        #print("IMGS", self.instance_images_path)
+        self.instance_images_path = sorted(Path(instance_data_root).iterdir())
+        # self.instance_images_path.sort(key=natural_keys)
+        # print("IMGS", self.instance_images_path)
         self.num_instance_images = len(self.instance_images_path)
         self.instance_prompt = instance_prompt
         self._length = self.num_instance_images
 
-        self.instance_identity_embeds_path = sorted(list(Path(instance_data_root.replace("images", "ArcFace_embeds")).iterdir()))
-        
-        
-        #self.instance_identity_embeds_path.sort(key=natural_keys)
-        #print("IDS", self.instance_identity_embeds_path)
+        self.instance_identity_embeds_path = sorted(
+            Path(instance_data_root.replace("images", "ArcFace_embeds")).iterdir()
+        )
+
+        # self.instance_identity_embeds_path.sort(key=natural_keys)
+        # print("IDS", self.instance_identity_embeds_path)
         if class_data_root is not None:
             self.class_data_root = Path(class_data_root)
             self.class_data_root.mkdir(parents=True, exist_ok=True)
             self.class_images_path = list(self.class_data_root.iterdir())
             if class_num is not None:
                 self.num_class_images = min(len(self.class_images_path), class_num)
-                #print(".")
+                # print(".")
             else:
                 self.num_class_images = len(self.class_images_path)
-                
+
             self._length = max(self.num_class_images, self.num_instance_images)
             self.class_prompt = class_prompt
-            self.class_identity_embeds_path = sorted(list(Path(class_data_root.replace("images", "ArcFace_embeds")).iterdir()))
+            self.class_identity_embeds_path = sorted(
+                Path(class_data_root.replace("images", "ArcFace_embeds")).iterdir()
+            )
         else:
             self.class_data_root = None
-
 
         self.image_transforms = transforms.Compose(
             [
@@ -320,11 +320,13 @@ class DreamBoothDataset(Dataset):
             example["instance_prompt_ids"] = text_inputs.input_ids
             example["instance_attention_mask"] = text_inputs.attention_mask
 
-        #print("Index:", index)
-        #print("Self ID embeds", len(self.instance_identity_embeds_path))
-        #print(index % self.num_instance_images)
-        example["instance_identity_embeds"] = torch.load(self.instance_identity_embeds_path[index % self.num_instance_images]) 
-        
+        # print("Index:", index)
+        # print("Self ID embeds", len(self.instance_identity_embeds_path))
+        # print(index % self.num_instance_images)
+        example["instance_identity_embeds"] = torch.load(
+            self.instance_identity_embeds_path[index % self.num_instance_images]
+        )
+
         if self.class_data_root:
             class_image = Image.open(self.class_images_path[index % self.num_class_images])
             class_image = exif_transpose(class_image)
@@ -342,12 +344,14 @@ class DreamBoothDataset(Dataset):
                 example["class_prompt_ids"] = class_text_inputs.input_ids
                 example["class_attention_mask"] = class_text_inputs.attention_mask
 
-            #print("Index:", index)
-            #print("Self ID embeds", len(self.class_identity_embeds_path))
-            #print(index % self.num_class_images)
-            example["class_identity_embeds"] = torch.load(self.class_identity_embeds_path[index % self.num_class_images]) 
-            
-            #exit()
+            # print("Index:", index)
+            # print("Self ID embeds", len(self.class_identity_embeds_path))
+            # print(index % self.num_class_images)
+            example["class_identity_embeds"] = torch.load(
+                self.class_identity_embeds_path[index % self.num_class_images]
+            )
+
+            # exit()
         return example
 
 
@@ -376,7 +380,7 @@ def collate_fn(examples, with_prior_preservation=False):
 
     input_ids = torch.cat(input_ids, dim=0)
     identity_embed = torch.cat(identity_embed, dim=0)
-    
+
     batch = {
         "input_ids": input_ids,
         "pixel_values": pixel_values,
@@ -405,6 +409,7 @@ class PromptDataset(Dataset):
         example["index"] = index
         return example
 
+
 def latents_to_pil_images(latents, vae):
     # bath of latents -> list of images
     latents = (1 / 0.18215) * latents
@@ -420,22 +425,22 @@ def latents_to_pil_images(latents, vae):
 # convert a normalized image back to RGB format suitable for PIL
 def reverse_normalized_image(img, multiply_255=True):
     mean = 0.5
-    std = 0.5 
+    std = 0.5
 
     denorm = transforms.Normalize(mean=[-mean / std], std=[1.0 / std])
 
-    img = denorm(img).clamp(0, 1)    
+    img = denorm(img).clamp(0, 1)
     if multiply_255:
-        img = (img * 255).to(dtype=torch.uint8)    
-    return img 
+        img = (img * 255).to(dtype=torch.uint8)
+    return img
 
 
 def latents_to_image_for_mtcnn(latents, vae):
     # batch of latents -> list of images
     latents = (1 / 0.18215) * latents
     # decode with the pretrained VAE
-    image = vae.decode(latents).sample #[0]
-    # Transform to image range ... TODO denormalize? 
+    image = vae.decode(latents).sample  # [0]
+    # Transform to image range ... TODO denormalize?
     image = (image / 2 + 0.5).clamp(0, 1)
     image = (image * 255)[0]
     image = torch.permute(image, (1, 2, 0))
@@ -445,14 +450,15 @@ def latents_to_image_for_mtcnn(latents, vae):
 def cropped_image_to_arcface_input(img):
     #  transform to (1, 3, X, X)
     img = torch.permute(img, (2, 0, 1))
-    #img = torch.nn.functional.adaptive_avg_pool2d(img, (112,112)) # TODO 
-    img = transforms.functional.resize(img, (112, 112), antialias=None) # TODO 
-    #img = torch.nn.functional.interpolate(img, [112,112]) 
+    # img = torch.nn.functional.adaptive_avg_pool2d(img, (112,112)) # TODO
+    img = transforms.functional.resize(img, (112, 112), antialias=None)  # TODO
+    # img = torch.nn.functional.interpolate(img, [112,112])
     # TODO maybe interpolate?
-    img = ((img / 255) - 0.5) / 0.5 
-    #img = img[None, :, :, :]
+    img = ((img / 255) - 0.5) / 0.5
+    # img = img[None, :, :, :]
     img = torch.unsqueeze(img, 0)
     return img
+
 
 def tokenize_prompt(tokenizer, prompt, tokenizer_max_length=None):
     if tokenizer_max_length is not None:
@@ -469,8 +475,6 @@ def tokenize_prompt(tokenizer, prompt, tokenizer_max_length=None):
     )
 
     return text_inputs
-
-
 
 
 def encode_prompt(text_encoder, input_ids, attention_mask, text_encoder_use_attention_mask=None):
@@ -491,7 +495,6 @@ def encode_prompt(text_encoder, input_ids, attention_mask, text_encoder_use_atte
     return prompt_embeds
 
 
-
 def contrastive_loss(x1, x2, label, margin: float = 1.0):
     dist = torch.nn.functional.pairwise_distance(x1, x2)
 
@@ -501,9 +504,7 @@ def contrastive_loss(x1, x2, label, margin: float = 1.0):
     return loss
 
 
-
 def main(args):
-
     logging_dir = Path(args.output_dir, cfg.logging_dir)
 
     accelerator_project_config = ProjectConfiguration(project_dir=args.output_dir, logging_dir=logging_dir)
@@ -512,9 +513,9 @@ def main(args):
         gradient_accumulation_steps=cfg.gradient_accumulation_steps,
         mixed_precision=cfg.mixed_precision,
         log_with=cfg.report_to,
-        project_config=accelerator_project_config
+        project_config=accelerator_project_config,
     )
-    
+
     print(accelerator)
 
     # Currently, it's not possible to do gradient accumulation when training two models with accelerate.accumulate
@@ -632,7 +633,7 @@ def main(args):
     # We only train the additional adapter LoRA layers
     if vae is not None:
         vae.requires_grad_(False)
-    # TODO ... DEBUGGING: set vae to train as well 
+    # TODO ... DEBUGGING: set vae to train as well
     text_encoder.requires_grad_(False)
     unet.requires_grad_(False)
 
@@ -735,7 +736,7 @@ def main(args):
 
         lora_state_dict, network_alphas = LoraLoaderMixin.lora_state_dict(input_dir)
 
-        unet_state_dict = {f'{k.replace("unet.", "")}': v for k, v in lora_state_dict.items() if k.startswith("unet.")}
+        unet_state_dict = {f"{k.replace('unet.', '')}": v for k, v in lora_state_dict.items() if k.startswith("unet.")}
         unet_state_dict = convert_unet_state_dict_to_peft(unet_state_dict)
         incompatible_keys = set_peft_model_state_dict(unet_, unet_state_dict, adapter_name="default")
 
@@ -839,7 +840,7 @@ def main(args):
 
         text_encoder = None
         tokenizer = None
-        
+
         gc.collect()
         torch.cuda.empty_cache()
     else:
@@ -857,7 +858,7 @@ def main(args):
         class_num=cfg.num_class_images,
         tokenizer=tokenizer,
         size=cfg.resolution,
-        #center_crop=cfg.center_crop,
+        # center_crop=cfg.center_crop,
         encoder_hidden_states=pre_computed_encoder_hidden_states,
         class_prompt_encoder_hidden_states=pre_computed_class_prompt_encoder_hidden_states,
         tokenizer_max_length=cfg.tokenizer_max_length,
@@ -908,7 +909,7 @@ def main(args):
     # The trackers initializes automatically on the main process.
     if accelerator.is_main_process:
         tracker_config = vars(copy.deepcopy(args))
-        #tracker_config.pop("validation_images")
+        # tracker_config.pop("validation_images")
         accelerator.init_trackers("dreambooth-lora", config=tracker_config)
 
     # Train!
@@ -950,8 +951,8 @@ def main(args):
 
             initial_global_step = global_step
             first_epoch = global_step // num_update_steps_per_epoch
-            #print(global_step)
-            #print(num_update_steps_per_epoch)
+            # print(global_step)
+            # print(num_update_steps_per_epoch)
     else:
         initial_global_step = 0
 
@@ -964,38 +965,40 @@ def main(args):
     )
 
     ###########################################################
-    # ArcFaceModel for Loss 
+    # ArcFaceModel for Loss
     arcface_model = prepare_locked_ArcFace_model()
     arcface_model.to(device=accelerator.device)
 
-    # TODO 
+    # TODO
     cos = torch.nn.CosineSimilarity(dim=1, eps=1e-6)
-    
+
     def cosine_distance(x, y):
-        sim = F.cosine_similarity(x, y) 
+        sim = F.cosine_similarity(x, y)
         distance = 1 - sim
         return distance
-    
-    triplet_loss_function = torch.nn.TripletMarginWithDistanceLoss(distance_function=cosine_distance)
-    
-    # MTCNN model for face detection
-    mtcnn_model = MTCNN(image_size=112,device=accelerator.device, margin=0)
 
+    triplet_loss_function = torch.nn.TripletMarginWithDistanceLoss(distance_function=cosine_distance)
+
+    # MTCNN model for face detection
+    mtcnn_model = MTCNN(image_size=112, device=accelerator.device, margin=0)
 
     final_state = False
 
     for epoch in range(first_epoch, cfg.num_train_epochs):
-        #print("Epoch", epoch)
+        # print("Epoch", epoch)
         unet.train()
-        avg_combined_loss = []; avg_id_loss = []; avg_instance_loss = []; avg_prior_loss = []
-        
+        avg_combined_loss = []
+        avg_id_loss = []
+        avg_instance_loss = []
+        avg_prior_loss = []
+
         if cfg.train_text_encoder:
             text_encoder.train()
         for step, batch in enumerate(train_dataloader):
             with accelerator.accumulate(unet):
-                pixel_values = batch["pixel_values"].to(dtype=weight_dtype) # shape [2,3,512,512]
-                gt_arcface_embed = batch["identity_embed"].to(dtype=weight_dtype) # shape [2,512]
-                
+                pixel_values = batch["pixel_values"].to(dtype=weight_dtype)  # shape [2,3,512,512]
+                gt_arcface_embed = batch["identity_embed"].to(dtype=weight_dtype)  # shape [2,512]
+
                 if vae is not None:
                     # Convert images to latent space
                     model_input = vae.encode(pixel_values).latent_dist.sample()
@@ -1010,9 +1013,9 @@ def main(args):
                 timesteps = torch.randint(
                     0, noise_scheduler.config.num_train_timesteps, (bsz,), device=model_input.device
                 )
-                #timesteps[0] = 0 # TODO
+                # timesteps[0] = 0 # TODO
                 timesteps = timesteps.long()
-                
+
                 # Add noise to the model input according to the noise magnitude at each timestep
                 # (this is the forward diffusion process)
                 noisy_model_input = noise_scheduler.add_noise(model_input, noise, timesteps)
@@ -1059,11 +1062,10 @@ def main(args):
                 else:
                     raise ValueError(f"Unknown prediction type {noise_scheduler.config.prediction_type}")
 
-
                 """
                 TODO
                 """
-                if cfg.with_prior_preservation: 
+                if cfg.with_prior_preservation:
                     # Chunk the noise and model_pred into two parts and compute the loss on each part separately.
                     model_pred, model_pred_prior = torch.chunk(model_pred, 2, dim=0)
                     target, target_prior = torch.chunk(target, 2, dim=0)
@@ -1075,69 +1077,87 @@ def main(args):
                     # Add the prior loss to the instance loss.
                     loss = instance_loss + cfg.prior_loss_weight * prior_loss
 
-                    #print(cfg.with_identity_loss)
-                    if cfg.which_loss == "identity": 
-                                                
-                        latent_x0 = noise_scheduler.step(model_pred, timesteps[0], noisy_model_input[0]).pred_original_sample
-                        
-                        # Perform face detection first 
-                        img = latents_to_image_for_mtcnn(latent_x0.to(weight_dtype), vae) 
+                    # print(cfg.with_identity_loss)
+                    if cfg.which_loss == "identity":
+                        latent_x0 = noise_scheduler.step(
+                            model_pred, timesteps[0], noisy_model_input[0]
+                        ).pred_original_sample
+
+                        # Perform face detection first
+                        img = latents_to_image_for_mtcnn(latent_x0.to(weight_dtype), vae)
                         bboxs, probs = mtcnn_model.detect(img, landmarks=False)
 
-                        if bboxs is not None: #and bboxs_prior is not None:  
-                            bbox = bboxs[0].astype(int) 
+                        if bboxs is not None:  # and bboxs_prior is not None:
+                            bbox = bboxs[0].astype(int)
                             initial_size = img.shape[0]
-                            img_cropped = img[max(0,bbox[1]): min(bbox[3], initial_size ) , max(0, bbox[0]): min(bbox[2], initial_size)] 
-                            
+                            img_cropped = img[
+                                max(0, bbox[1]) : min(bbox[3], initial_size),
+                                max(0, bbox[0]) : min(bbox[2], initial_size),
+                            ]
+
                             img_cropped = cropped_image_to_arcface_input(img_cropped)
                             pred_arcface_features = arcface_model(img_cropped)
-                            
+
                             # compare arcface features between predicted face and gt face
                             arcface_cos_similarity = cos(pred_arcface_features, gt_arcface_embed[0])
-                            
-                            identity_loss = 1 - arcface_cos_similarity #((1 - arcface_cos_similarity) + (1 - arcface_cos_similarity_prior)) / 2 # TODO check is this ok                         
 
-                            identity_noise_level_weight = (1 - timesteps[0] / noise_scheduler.config.num_train_timesteps) ** 2
-                            if not cfg.timestep_loss_weighting: identity_noise_level_weight = 1 
-                            
+                            identity_loss = (
+                                1 - arcface_cos_similarity
+                            )  # ((1 - arcface_cos_similarity) + (1 - arcface_cos_similarity_prior)) / 2 # TODO check is this ok
+
+                            identity_noise_level_weight = (
+                                1 - timesteps[0] / noise_scheduler.config.num_train_timesteps
+                            ) ** 2
+                            if not cfg.timestep_loss_weighting:
+                                identity_noise_level_weight = 1
+
                             loss = loss + identity_noise_level_weight * identity_loss
-                        #else: 
+                        # else:
                         #    print("not detected", timesteps[0])
-                    
-                    if cfg.which_loss == "triplet_prior": 
-                        
-                        latent_x0 = noise_scheduler.step(model_pred, timesteps[0], noisy_model_input[0]).pred_original_sample
-                        
-                        #print(latent_x0)
-                        
-                        # Perform face detection first 
-                        img = latents_to_image_for_mtcnn(latent_x0.to(weight_dtype), vae) 
+
+                    if cfg.which_loss == "triplet_prior":
+                        latent_x0 = noise_scheduler.step(
+                            model_pred, timesteps[0], noisy_model_input[0]
+                        ).pred_original_sample
+
+                        # print(latent_x0)
+
+                        # Perform face detection first
+                        img = latents_to_image_for_mtcnn(latent_x0.to(weight_dtype), vae)
                         bboxs, probs = mtcnn_model.detect(img, landmarks=False)
-                        
-                        #latent_x0_prior = noise_scheduler.step(model_pred_prior, timesteps[1], noisy_model_input[1]).pred_original_sample
-                        #img_prior = latents_to_image_for_mtcnn(latent_x0_prior.to(weight_dtype), vae) 
+
+                        # latent_x0_prior = noise_scheduler.step(model_pred_prior, timesteps[1], noisy_model_input[1]).pred_original_sample
+                        # img_prior = latents_to_image_for_mtcnn(latent_x0_prior.to(weight_dtype), vae)
                         # bboxs_prior, probs_prior = mtcnn_model.detect(img_prior, landmarks=False)
-                        
-                        if bboxs is not None: #and bboxs_prior is not None:  
-                            bbox = bboxs[0].astype(int) 
+
+                        if bboxs is not None:  # and bboxs_prior is not None:
+                            bbox = bboxs[0].astype(int)
                             initial_size = img.shape[0]
-                            img_cropped = img[max(0,bbox[1]): min(bbox[3], initial_size ) , max(0, bbox[0]): min(bbox[2], initial_size)] 
-                            
+                            img_cropped = img[
+                                max(0, bbox[1]) : min(bbox[3], initial_size),
+                                max(0, bbox[0]) : min(bbox[2], initial_size),
+                            ]
+
                             img_cropped = cropped_image_to_arcface_input(img_cropped)
                             pred_arcface_features = arcface_model(img_cropped)
-                            
-                            identity_noise_level_weight = (1 - timesteps[0] / noise_scheduler.config.num_train_timesteps)  ** 2
-                            if not cfg.timestep_loss_weighting: identity_noise_level_weight = 1 
+
+                            identity_noise_level_weight = (
+                                1 - timesteps[0] / noise_scheduler.config.num_train_timesteps
+                            ) ** 2
+                            if not cfg.timestep_loss_weighting:
+                                identity_noise_level_weight = 1
 
                             # input: anchor, positive, negative
-                            triplet_loss = triplet_loss_function(pred_arcface_features, gt_arcface_embed[0][None, :], gt_arcface_embed[1][None, :])
-                            loss = loss +  identity_noise_level_weight * triplet_loss
-                        
+                            triplet_loss = triplet_loss_function(
+                                pred_arcface_features, gt_arcface_embed[0][None, :], gt_arcface_embed[1][None, :]
+                            )
+                            loss = loss + identity_noise_level_weight * triplet_loss
+
                 else:
                     instance_loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
                     loss = instance_loss
-                
-                accelerator.backward(loss)  
+
+                accelerator.backward(loss)
 
                 if accelerator.sync_gradients:
                     accelerator.clip_grad_norm_(params_to_optimize, cfg.max_grad_norm)
@@ -1155,32 +1175,39 @@ def main(args):
 
             if cfg.with_prior_preservation:
                 step_prior_loss = prior_loss.detach().item()
-            else: step_prior_loss = 0 
+            else:
+                step_prior_loss = 0
 
             if cfg.which_loss == "identity":
                 step_id_loss = identity_loss.detach().item()
             elif cfg.which_loss == "triplet_prior":
                 step_id_loss = triplet_loss.detach().item()
-            else: step_id_loss = 0
+            else:
+                step_id_loss = 0
 
             avg_combined_loss.append(step_loss)
             avg_instance_loss.append(step_instance_loss)
             avg_prior_loss.append(step_prior_loss)
             avg_id_loss.append(step_id_loss)
 
-            logs = {"Step Loss/Reconstruction": step_instance_loss, "Step Loss/ID": step_id_loss,  
-                    "Step Loss/Prior": step_prior_loss, "Step Loss/Combined": step_loss, "LR": lr_scheduler.get_last_lr()[0]}
+            logs = {
+                "Step Loss/Reconstruction": step_instance_loss,
+                "Step Loss/ID": step_id_loss,
+                "Step Loss/Prior": step_prior_loss,
+                "Step Loss/Combined": step_loss,
+                "LR": lr_scheduler.get_last_lr()[0],
+            }
             progress_bar.set_postfix(**logs)
             accelerator.log(logs, step=global_step)
 
             if cfg.max_train_steps is not None and global_step >= cfg.max_train_steps:
                 final_state = True
                 break
-        
+
         # Checks if the accelerator has performed an optimization step behind the scenes
         if accelerator.is_main_process:
-            if (epoch + 1) % cfg.checkpointing_epochs == 0 or final_state: 
-            #if global_step % cfg.checkpointing_steps == 0:
+            if (epoch + 1) % cfg.checkpointing_epochs == 0 or final_state:
+                # if global_step % cfg.checkpointing_steps == 0:
                 # _before_ saving state, check if this save would set us over the `checkpoints_total_limit`
                 if cfg.checkpoints_total_limit is not None:
                     checkpoints = os.listdir(args.output_dir)
@@ -1232,9 +1259,13 @@ def main(args):
                     pipeline_args,
                     epoch,
                 )
-        
-        epoch_logs = {"Epoch Loss/Reconstruction": np.mean(np.array(avg_instance_loss)), "Epoch Loss/ID": np.mean(np.array(avg_id_loss)),
-                      "Epoch Loss/Prior": np.mean(np.array(avg_prior_loss)), "Epoch Loss/Combined": np.mean(np.array(avg_combined_loss)),}
+
+        epoch_logs = {
+            "Epoch Loss/Reconstruction": np.mean(np.array(avg_instance_loss)),
+            "Epoch Loss/ID": np.mean(np.array(avg_id_loss)),
+            "Epoch Loss/Prior": np.mean(np.array(avg_prior_loss)),
+            "Epoch Loss/Combined": np.mean(np.array(avg_combined_loss)),
+        }
         accelerator.log(epoch_logs, step=global_step)
 
     # Save the lora layers
@@ -1279,21 +1310,21 @@ def main(args):
                 is_final_validation=True,
             )
 
-
     accelerator.end_training()
-
 
 
 if __name__ == "__main__":
     args = parse_args()
 
     id_folders = os.listdir(cfg.source_folder)
-    
-    for which_loss in cfg.losses_to_test:#["triplet_prior"]:#,# "identity", "triplet_prior"]:#["", "identity", "triplet_prior"]:
+
+    for (
+        which_loss
+    ) in cfg.losses_to_test:  # ["triplet_prior"]:#,# "identity", "triplet_prior"]:#["", "identity", "triplet_prior"]:
         cfg.which_loss = which_loss
         output_folder = cfg.output_folder
-        
-        if cfg.train_text_encoder: 
+
+        if cfg.train_text_encoder:
             output_folder += "_WithTextEncoder"
 
         loss_folder = ""
@@ -1305,30 +1336,31 @@ if __name__ == "__main__":
             loss_folder = "ID-Booth"
 
         output_folder = os.path.join(output_folder, loss_folder)
-        
+
         cfg.instance_data_dir = cfg.source_folder
         args.output_dir = output_folder
-        
+
         print("Args:", vars(args))
         os.makedirs(args.output_dir, exist_ok=True)
-        
+
         # Save args to json
         json_output_file = os.path.join(args.output_dir, "training_config.json")
-        with open(json_output_file, 'w') as fp:
-
-            config_vars={var:vars(cfg)[var] for var in dir(cfg) if not var.startswith('_')}
-            args_vars = vars(args) 
+        with open(json_output_file, "w") as fp:
+            config_vars = {var: vars(cfg)[var] for var in dir(cfg) if not var.startswith("_")}
+            args_vars = vars(args)
             all_args = config_vars | args_vars
             json.dump(all_args, fp, indent=4)
-        
+
         id_folders.sort(key=natural_keys)
-        id_limit = 0 # 5 # TODO  
-        for i, id_folder in enumerate(id_folders): 
+        id_limit = 0  # 5 # TODO
+        for i, id_folder in enumerate(id_folders):
             print(id_folder)
-            if id_limit != 0 and i > id_limit: 
+            if id_limit != 0 and i > id_limit:
                 print(f"Limit training to {id_limit} identities.")
-                continue 
-            
-            cfg.instance_data_dir = os.path.join(cfg.source_folder, id_folder) # "./DATASETS/TUFTS_TEST_512/images_id_1"
-            args.output_dir = os.path.join(output_folder, id_folder) 
+                continue
+
+            cfg.instance_data_dir = os.path.join(
+                cfg.source_folder, id_folder
+            )  # "./DATASETS/TUFTS_TEST_512/images_id_1"
+            args.output_dir = os.path.join(output_folder, id_folder)
             main(args)
