@@ -36,7 +36,7 @@ This is the official implementation of the [ID-Booth framework](https://arxiv.or
 ## <div align="center"> Installation </div>
 
 ```bash
-conda create -n id-booth python=3.10
+conda create -n id-booth -f environment.yml
 conda activate id-booth
 pip install -r requirements.txt
 ```
@@ -129,6 +129,3 @@ If you use the code or results from this repository, please cite the ID-Booth pa
 Supported in parts by the Slovenian Research and Innovation Agency (ARIS) through the Research Programmes P2-0250 (B) "Metrology and Biometric Systems" and P2--0214 (A) “Computer Vision”, the ARIS Project J2-50065 "DeepFake DAD" and the ARIS Young Researcher Programme.
 
 <img src="./assets/ARIS_logo_eng_resized.jpg" alt="ARIS_logo_eng_resized" width="400"/>
-
-
-
