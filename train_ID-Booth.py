@@ -33,7 +33,7 @@ import transformers
 from accelerate import Accelerator
 from accelerate.logging import get_logger
 from accelerate.utils import ProjectConfiguration, set_seed
-from facenet_pytorch import MTCNN  # I really do not want to use facenet-pytorch!
+from facenet_pytorch import MTCNN
 from huggingface_hub import create_repo, upload_folder
 from huggingface_hub.utils import insecure_hashlib
 from packaging import version

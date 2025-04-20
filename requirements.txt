@@ -2,3 +2,6 @@ ipywidgets==8.1.*
 transformers==4.48.*
 diffusers==0.32.*
 accelerate==1.5.*
+peft==0.15.*
+wandb==0.19.*
+# facenet-pytorch==2.6.*  # facenet-pytorch should be installed with --no-deps flag
