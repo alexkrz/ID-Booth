@@ -6,3 +6,6 @@
 
 # Reslts/
 /results/
+
+# Artifacts
+*__pycache__
